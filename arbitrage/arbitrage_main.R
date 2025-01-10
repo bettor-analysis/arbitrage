@@ -1,0 +1,284 @@
+# Main Market Arbitrage Bet Finder
+# Adam Wickwire - Bettor Analysis
+# 2024-09-29
+
+
+# Load Libraries -----------------------------------------------------------------------#
+library(tidyverse)
+library(oddsapiR)
+library(lubridate)
+library(stringr)
+#---------------------------------------------------------------------------------------#
+
+
+# Set API Key --------------------------------------------------------------------------#
+api_key <- Sys.getenv("ODDS_API_KEY")
+#---------------------------------------------------------------------------------------#
+
+
+
+# Get all sports keys from the API
+# all_sports <- toa_sports(all_sports = TRUE)
+# 
+# all_sports <- all_sports %>% 
+#   filter(active == TRUE)
+#
+# americanfootball_nfl
+# basketball_nba
+# icehockey_nhl
+# basketball_ncaab
+# soccer_epl
+# baseball_mlb
+
+
+
+get_sport_odds <- toa_sports_odds(
+  sport_key = "basketball_nba",
+  regions = "eu,us,us2,us_ex",
+  markets = "h2h,spreads,totals",
+  odds_format = "decimal",
+  date_format = "iso"
+)
+
+
+get_sport_odds <- toa_sports_odds(
+  sport_key = "basketball_nba",
+  regions = "us2,us_ex",
+  markets = "h2h,spreads,totals",
+  odds_format = "decimal",
+  date_format = "iso"
+)
+
+
+get_sport_odds <- get_sport_odds %>%
+  filter(bookmaker_key %in% c("fliff", "prophetx", "novig"))
+
+#---------------------------------------------------------------------------------------#
+#---------------------------------------------------------------------------------------#
+
+
+# Set the current date and time
+current_time <- Sys.time()
+
+# Ensure the start_date column is in POSIXct format
+get_sport_odds$commence_time <- ymd_hms(get_sport_odds$commence_time)
+get_sport_odds$bookmaker_last_update <- ymd_hms(get_sport_odds$bookmaker_last_update)
+get_sport_odds$market_last_update <- ymd_hms(get_sport_odds$market_last_update)
+
+# Convert to Central Time
+get_sport_odds$commence_time <- with_tz(get_sport_odds$commence_time, tzone = "America/Chicago")
+get_sport_odds$bookmaker_last_update <- with_tz(get_sport_odds$bookmaker_last_update, tzone = "America/Chicago")
+get_sport_odds$market_last_update <- with_tz(get_sport_odds$market_last_update, tzone = "America/Chicago")
+
+# convert time from military time to standard time
+get_sport_odds$commence_time <- format(get_sport_odds$commence_time, "%Y-%m-%d %I:%M %p")
+get_sport_odds$bookmaker_last_update <- format(get_sport_odds$bookmaker_last_update, "%Y-%m-%d %I:%M %p")
+get_sport_odds$market_last_update <- format(get_sport_odds$market_last_update, "%Y-%m-%d %I:%M %p")
+
+
+
+
+#---------------------------------------------------------------------------------------#
+
+
+# Create a list of all the bookmakers
+bookmakers <- get_sport_odds %>%
+  select(bookmaker) %>%
+  distinct() %>% 
+  arrange(bookmaker)
+
+# Create a list of all the bookmakers
+bookmakers_key <- get_sport_odds %>%
+  select(bookmaker_key) %>%
+  distinct() %>%
+  arrange(bookmaker_key)
+
+event_id <- get_sport_odds %>%
+  select(id) %>%
+  distinct() 
+
+sports_odds <- get_sport_odds 
+
+#---------------------------------------------------------------------------------------#
+# h2h, totals, spreads 
+
+# create three dataframes for each market
+h2h <- sports_odds %>%
+  filter(market_key == "h2h")
+
+totals <- sports_odds %>%
+  filter(market_key == "totals")
+
+spreads <- sports_odds %>%
+  filter(market_key == "spreads")
+
+#---------------------------------------------------------------------------------------#
+
+find_arbitrage_opportunities <- function(data, total_investment = 500) {
+
+  # Step 1: Find the best odds and corresponding bookmakers for each outcome
+  best_odds <- data %>%
+    group_by(id, outcomes_name) %>%
+    arrange(desc(outcomes_price)) %>%
+    slice(1) %>%  # Take the row with the highest odds
+    ungroup()
+  
+  # Step 2: Pivot the data to longer format
+  odds_long <- best_odds %>%
+    select(id, outcomes_name, outcomes_price, bookmaker) %>%
+    mutate(outcomes_name = make.names(outcomes_name))  # Ensure valid column names
+  
+  # Step 3: Calculate the synthetic hold for each match
+  odds_long <- odds_long %>%
+    group_by(id) %>%
+    mutate(
+      hold = sum(1 / outcomes_price, na.rm = TRUE) - 1,
+      arbitrage_opportunity = hold < 0
+    )
+  
+  # Step 4: Calculate Stake Amounts and Expected Profit
+  odds_long <- odds_long %>%
+    group_by(id) %>%
+    mutate(
+      sum_inverse_odds = sum(1 / outcomes_price, na.rm = TRUE),
+      stake = (total_investment * (1 / outcomes_price)) / sum_inverse_odds,
+      expected_return = stake * outcomes_price,
+      profit = expected_return - total_investment,
+      profit_percentage = (profit / total_investment) * 100
+    ) %>%
+    ungroup()
+  
+  # Step 5: Add match information
+  match_info <- data %>%
+    select(id, commence_time, home_team, away_team) %>%
+    distinct()
+  
+  final_result <- odds_long %>%
+    left_join(match_info, by = "id")
+  
+  return(final_result)
+}
+
+
+# For H2H Market
+arbitrage_h2h <- find_arbitrage_opportunities(h2h)
+
+# For Spreads Market
+arbitrage_spreads <- find_arbitrage_opportunities(spreads)
+
+# For Totals Market
+arbitrage_totals <- find_arbitrage_opportunities(totals)
+
+
+#---------------------------------------------------------------------------------------#
+# Ensure the decimal_to_american function works correctly on vectors
+decimal_to_american <- function(decimal_odds) {
+  american_odds <- ifelse(
+    decimal_odds >= 2,
+    (decimal_odds - 1) * 100,
+    -100 / (decimal_odds - 1)
+  )
+  return(american_odds)
+}
+
+#---------------------------------------------------------------------------------------#
+
+arbitrage_h2h <- arbitrage_h2h %>% 
+  mutate(market_key = "h2h") %>% 
+  select(commence_time, home_team, away_team, market_key, outcomes_name, 
+         outcomes_price, bookmaker, hold, stake, profit, arbitrage_opportunity) %>% 
+  mutate(
+    hold = round(hold, 4),
+    stake = round(stake, 2),
+    profit = round(profit, 2)
+  )
+
+arbitrage_spreads <- arbitrage_spreads %>% 
+  mutate(market_key = "spreads") %>% 
+  select(commence_time, home_team, away_team, market_key, outcomes_name, 
+         outcomes_price, bookmaker, hold, stake, profit, arbitrage_opportunity) %>% 
+  mutate(
+    hold = round(hold, 4),
+    stake = round(stake, 2),
+    profit = round(profit, 2)
+  )
+
+arbitrage_totals <- arbitrage_totals %>%
+  mutate(market_key = "totals") %>%
+  select(commence_time, home_team, away_team, market_key, outcomes_name, 
+         outcomes_price, bookmaker, hold, stake, profit, arbitrage_opportunity) %>%
+  mutate(
+    hold = round(hold, 4),
+    stake = round(stake, 2),
+    profit = round(profit, 2)
+  )
+
+#---------------------------------------------------------------------------------------#
+
+arbitrage_main_all <- bind_rows(arbitrage_h2h, arbitrage_spreads, arbitrage_totals)
+
+#---------------------------------------------------------------------------------------#
+
+arbitrage_main_all <- arbitrage_main_all %>%
+  mutate(outcomes_name = str_replace_all(outcomes_name, "\\.", " "))
+
+arbitrage_main_all <- arbitrage_main_all %>%
+  mutate(game_id = paste(commence_time, home_team, away_team, market_key, sep = "_"))
+
+arbitrage_main_all <- arbitrage_main_all %>% 
+  mutate(outcomes_price = round(decimal_to_american(outcomes_price)))
+
+#---------------------------------------------------------------------------------------#
+
+
+# Map 'Over' and 'Under' to 'away' and 'home' teams for 'totals' market
+arbitrage_main_all <- arbitrage_main_all %>%
+  mutate(
+    # For 'totals' market, map 'Over' to 'away_team' and 'Under' to 'home_team'
+    adjusted_outcomes_name = case_when(
+      market_key == 'totals' & outcomes_name == 'Over' ~ away_team,
+      market_key == 'totals' & outcomes_name == 'Under' ~ home_team,
+      TRUE ~ outcomes_name
+    )
+  )
+
+# Create 'outcome_type' column based on adjusted outcomes
+arbitrage_main_all <- arbitrage_main_all %>%
+  mutate(
+    outcome_type = case_when(
+      adjusted_outcomes_name == home_team ~ 'home',
+      adjusted_outcomes_name == away_team ~ 'away',
+    )
+  )
+
+# Pivot the data to wide format
+arbitrage_main_all <- arbitrage_main_all %>%
+  select(
+    game_id, commence_time, home_team, away_team, market_key, hold, arbitrage_opportunity,
+    outcome_type, outcomes_name, outcomes_price, bookmaker, stake, profit
+  ) %>%
+  pivot_wider(
+    names_from = outcome_type,
+    values_from = c(outcomes_name, outcomes_price, bookmaker, stake, profit),
+    names_sep = "_"
+  )
+
+
+arbitrage_main_all <- arbitrage_main_all %>%
+  select(commence_time, home_team, away_team, market_key, 
+    outcomes_name_home, outcomes_price_home, outcomes_name_away, outcomes_price_away,
+    bookmaker_home, bookmaker_away, hold, stake_home, stake_away, profit_home, arbitrage_opportunity) %>% 
+  rename(
+    home_price = outcomes_price_home,
+    away_price = outcomes_price_away,
+    outcomes_home = outcomes_name_home,
+    outcomes_away = outcomes_name_away,
+    profit = profit_home
+  )
+
+#---------------------------------------------------------------------------------------#
+
+arbitrage_main_all <- arbitrage_main_all %>%
+  filter(arbitrage_opportunity == TRUE)
+
+profit <- sum(arbitrage_main_all$profit)
